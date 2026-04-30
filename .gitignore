@@ -209,5 +209,8 @@ __marimo__/
 # Credentials
 credentials.json
 
+# Local configuration (not committed)
+local.properties
+
 .idea
 user_data

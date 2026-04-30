@@ -1,15 +1,34 @@
+from typing import List
+import os
+
 import gspread
 from playwright.sync_api import sync_playwright, Page, Locator, ViewportSize
 from playwright_stealth import Stealth
-from typing import List, Set
+
+
+def read_properties(filepath: str = 'local.properties') -> dict:
+    """Read key=value pairs from a local.properties file."""
+    config = {}
+    if not os.path.exists(filepath):
+        return config
+
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    config[key.strip()] = value.strip()
+    return config
+
 
 class FacebookScraper:
     def __init__(
-        self,
-        group_url: str,
-        sheet_name: str,
-        credentials_path: str = 'credentials.json',
-        headless: bool = False
+            self,
+            group_url: str,
+            sheet_name: str,
+            credentials_path: str = 'credentials.json',
+            headless: bool = False
     ) -> None:
         self.group_url = group_url
         self.sheet_name = sheet_name
@@ -18,7 +37,6 @@ class FacebookScraper:
 
         # Scraper state: A list of rows (each row is a list of strings)
         self.scraped_posts: List[List[str]] = []
-        self.seen_texts: Set[str] = set()
 
         # Initialize Google Sheets types
         self.gc: gspread.Client = gspread.service_account(filename=self.credentials_path)
@@ -28,7 +46,7 @@ class FacebookScraper:
     @staticmethod
     def _get_timestamp(
             container: Locator,
-        page: Page
+            page: Page
     ) -> str:
         """Extracts the precise post time via hover."""
         try:
@@ -56,33 +74,43 @@ class FacebookScraper:
             try:
                 see_more_btn.click()
                 page.wait_for_timeout(1000)
-            except Exception:
+            except Exception as e:
+                print(f"Fail to expand content: {e}")
                 pass
 
-    def run(self, max_posts: int = 30) -> None:
+    def run(self, max_posts: int = 30, batch_size: int = 10) -> None:
         """Main scraping loop."""
-        stealth_config = Stealth()
-
+        stealth = Stealth()
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 "user_data",
-                headless=self.headless, # Keep False to handle manual login/check
-                slow_mo=500,            # Human-like delay
-                viewport=ViewportSize(width=1280, height=1080)
+                headless=self.headless,  # Keep False to handle manual login/check
+                slow_mo=500,  # Human-like delay
+                viewport=ViewportSize(width=1280, height=1080),
+                args=['--disable-images', '--disable-fonts']
             )
             page: Page = context.new_page()
+            stealth.apply_stealth_sync(page)
+            context.route(
+                "**/*",
+                lambda route: route.abort() if (
+                        route.request.resource_type in ["image", "media", "font"] or
+                        route.request.url.endswith(('.mp4', '.webm', '.ogg', '.mov', '.avi'))
+                ) else route.continue_()
+            )
             page.goto(self.group_url)
 
             print(f"Targeting: {self.group_url}")
             page.wait_for_selector('div[role="feed"]', timeout=160000)
 
             seen_texts = set()
-            reached_target_date = False
+            reached_max_posts = False
+            total_scraped = 0
 
-            while not reached_target_date:
+            while not reached_max_posts:
                 locator = page.locator('div[data-ad-rendering-role="story_message"]')
                 total: int = locator.count()
-                print(f"目前找到 {total} 則貼文，已儲存 {len(self.scraped_posts)} 則")
+                print(f"目前找到 {total} 則貼文，已儲存 {total_scraped} 則")
 
                 for i in range(total):
                     try:
@@ -93,10 +121,7 @@ class FacebookScraper:
                         title_text = title_el.inner_text(timeout=5000).strip() if title_el.count() > 0 else "無標題"
 
                         # 展開「查看更多」
-                        see_more_btn = container.locator('div[role="button"]').first
-                        if see_more_btn.count() > 0 and see_more_btn.is_visible(timeout=5000):
-                            see_more_btn.click()
-                            page.wait_for_timeout(1500)
+                        self._expand_content(container, page)
 
                         # 抓完整內文，去重
                         story_content = container.inner_text(timeout=5000).strip()
@@ -105,20 +130,20 @@ class FacebookScraper:
                         seen_texts.add(story_content[:150])
 
                         # 懸停取得精確時間
-                        big_box = container.locator('xpath=./../../..')
-                        time_link = big_box.locator('div.html-div span span.html-span a[role="link"]').first
-                        post_time = "未知時間"
-                        if time_link.count() > 0:
-                            time_link.hover()
-                            page.wait_for_timeout(800)
-                            tooltip = page.locator('div[role="tooltip"]').first
-                            if tooltip.count() > 0:
-                                post_time = tooltip.inner_text().strip()
-                            else:
-                                post_time = time_link.get_attribute("aria-label") or "未知時間"
+                        post_time = self._get_timestamp(container, page)
 
                         self.scraped_posts.append([title_text, story_content, post_time])
-                        print(f"  已儲存第 {len(self.scraped_posts)} 則：{title_text[:20]}...")
+                        total_scraped += 1
+                        print(f"  已儲存第 {total_scraped} 則：{title_text[:20]}...")
+
+                        # Batch upload check
+                        if len(self.scraped_posts) >= batch_size:
+                            print(f"Uploading batch of {len(self.scraped_posts)} posts...")
+                            try:
+                                self._upload_to_sheet()
+                                self.scraped_posts.clear()
+                            except Exception as e:
+                                print(f"Batch upload failed: {e}. Will retry later.")
 
 
                     except Exception as e:
@@ -130,14 +155,19 @@ class FacebookScraper:
                 page.wait_for_timeout(3000)
 
                 # 停止條件：之後可改為比對 TARGET_DATE
-                if len(self.scraped_posts) > max_posts:
-                    reached_target_date = True
+                if total_scraped >= max_posts:
+                    reached_max_posts = True
 
-            print(f"Finished. Scraped {len(self.scraped_posts)} posts.")
+            # Upload any remaining posts
+            if self.scraped_posts:
+                print(f"Uploading remaining {len(self.scraped_posts)} posts...")
+                try:
+                    self._upload_to_sheet()
+                except Exception as e:
+                    print(f"Final upload failed: {e}")
+
+            print(f"Finished. Scraped {total_scraped} posts.")
             context.close()
-
-            # Upload to Google Sheet
-            self._upload_to_sheet()
 
     def _upload_to_sheet(self) -> None:
         """Appends the scraped data to the Google Sheet."""
@@ -151,12 +181,22 @@ class FacebookScraper:
 
 
 if __name__ == "__main__":
-    # --- CONFIGURATION ---
-    # GROUP_URL = "https://www.facebook.com/groups/NCCUSTUDENT"
-    GROUP_URL = "https://www.facebook.com/groups/385397094898737"
+    # Read configuration from local.properties (if exists)
+    config = read_properties('local.properties')
+
+    GROUP_URL = config.get('GROUP_URL', 'https://www.facebook.com/groups/NCCUSTUDENT')
+    SHEET_NAME = config.get('SHEET_NAME', 'FBGroup')
+    CREDENTIALS_PATH = config.get('CREDENTIALS_PATH', 'credentials.json')
+    HEADLESS = config.get('HEADLESS', 'false').lower() == 'true'
+    MAX_POSTS = int(config.get('MAX_POSTS', '200'))
+    BATCH_SIZE = int(config.get('BATCH_SIZE', '10'))
+
+    print(f"Configuration loaded: URL={GROUP_URL[:50]}..., Sheet={SHEET_NAME}")
 
     scraper = FacebookScraper(
         group_url=GROUP_URL,
-        sheet_name="FBGroup"
+        sheet_name=SHEET_NAME,
+        credentials_path=CREDENTIALS_PATH,
+        headless=HEADLESS
     )
-    scraper.run(max_posts=30)
+    scraper.run(max_posts=MAX_POSTS, batch_size=BATCH_SIZE)
